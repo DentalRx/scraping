@@ -1,3 +1,10 @@
 requests>=2.28.0
 beautifulsoup4>=4.11.0
 python-dotenv>=1.0.0
+
+# Google Drive upload (scrape.py --upload-drive)
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
+# clients.yaml slug -> Notion page-id map
+PyYAML>=6.0

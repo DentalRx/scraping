@@ -2,8 +2,20 @@
 """
 Website Scraper - Extracts JSON-LD, text content, and images from sitemap URLs.
 
-Configuration is loaded from .env file. Just edit .env and run:
+Output layout (a clean, browsable migration reference):
+
+    <output_dir>/
+        pages/   <slug>.txt    one text file per page
+        jsonld/  <slug>.json   JSON-LD for pages that have it
+        images/  <hash>.<ext>  de-duplicated images (+ _manifest.json)
+        urls_scraped.txt       the list of URLs that were crawled
+
+Run it directly to read configuration from .env:
+
     python scrape_sitemap.py
+
+Or drive it from scrape.py (which adds --client / --url / --upload-drive), or
+import scrape_site() to reuse the crawl.
 """
 
 import json
@@ -22,6 +34,12 @@ import xml.etree.ElementTree as ET
 # Load environment variables from .env file
 load_dotenv()
 
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+}
+
 
 def sanitize_filename(url):
     """Convert URL to a safe folder name."""
@@ -36,6 +54,20 @@ def sanitize_filename(url):
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         safe_name = safe_name[:90] + '_' + url_hash
     return safe_name
+
+
+def _unique_slug(base, url, used):
+    """Return a slug not already in `used`, disambiguating collisions by url hash."""
+    slug = base
+    if slug in used:
+        suffix = hashlib.md5(url.encode()).hexdigest()[:6]
+        slug = f"{base}_{suffix}"
+        n = 2
+        while slug in used:
+            slug = f"{base}_{suffix}_{n}"
+            n += 1
+    used.add(slug)
+    return slug
 
 
 def fetch_sitemap(sitemap_url):
@@ -225,15 +257,13 @@ def download_image(url, save_path, headers):
         return None
 
 
-def scrape_page(url, output_dir, images_dir, headers, download_images=True):
-    """Scrape a single page and save results."""
-    print(f"\nScraping: {url}")
+def scrape_page(url, pages_dir, jsonld_dir, images_dir, headers,
+                download_images=True, used_slugs=None, image_manifest=None, log=print):
+    """Scrape a single page into the pages/ jsonld/ images/ layout."""
+    log(f"\nScraping: {url}")
 
-    # Create folder for this page
-    folder_name = sanitize_filename(url)
-    page_dir = os.path.join(output_dir, folder_name)
-
-    os.makedirs(page_dir, exist_ok=True)
+    used_slugs = used_slugs if used_slugs is not None else set()
+    slug = _unique_slug(sanitize_filename(url), url, used_slugs)
 
     try:
         response = requests.get(url, headers=headers, timeout=30)
@@ -241,58 +271,131 @@ def scrape_page(url, output_dir, images_dir, headers, download_images=True):
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Extract JSON-LD
+        # Extract JSON-LD *before* extract_text_content(), which strips <script>.
         json_ld = extract_json_ld(soup)
-        json_ld_path = os.path.join(page_dir, 'json_ld.txt')
-        with open(json_ld_path, 'w', encoding='utf-8') as f:
-            f.write(f"Source URL: {url}\n")
-            f.write("=" * 50 + "\n\n")
-            if json_ld:
-                f.write(json.dumps(json_ld, indent=2, ensure_ascii=False))
-            else:
-                f.write("No JSON-LD data found on this page.")
-        print(f"  Saved JSON-LD ({len(json_ld)} items)")
+        if json_ld:
+            jsonld_path = os.path.join(jsonld_dir, slug + '.json')
+            with open(jsonld_path, 'w', encoding='utf-8') as f:
+                json.dump({'source_url': url, 'json_ld': json_ld}, f, indent=2, ensure_ascii=False)
+            log(f"  Saved JSON-LD ({len(json_ld)} items)")
+        else:
+            log("  No JSON-LD found")
 
-        # Extract text content
+        # Extract text content (mutates soup: removes script/nav/footer/etc.)
         text_content = extract_text_content(soup)
-        text_path = os.path.join(page_dir, 'page_text.txt')
+        text_path = os.path.join(pages_dir, slug + '.txt')
         with open(text_path, 'w', encoding='utf-8') as f:
             f.write(f"Source URL: {url}\n")
             f.write("=" * 50 + "\n\n")
             f.write(text_content)
-        print(f"  Saved page text")
+        log("  Saved page text")
 
         # Extract and download images
         images = extract_images(soup, url)
-        print(f"  Found {len(images)} images")
+        log(f"  Found {len(images)} images")
 
         if download_images and images:
-            downloaded = []
+            downloaded = 0
             for i, img in enumerate(images):
                 filename = download_image(img['url'], images_dir, headers)
                 if filename:
-                    downloaded.append({
-                        'filename': filename,
-                        'original_url': img['url'],
-                        'alt': img['alt'],
-                        'source_page': url
-                    })
+                    downloaded += 1
+                    if image_manifest is not None and filename not in image_manifest:
+                        image_manifest[filename] = {
+                            'original_url': img['url'],
+                            'alt': img['alt'],
+                            'source_page': url,
+                        }
                 # Rate limiting
                 if i > 0 and i % 10 == 0:
                     time.sleep(0.5)
 
-            print(f"  Downloaded {len(downloaded)} images")
+            log(f"  Downloaded {downloaded} images")
 
         return True
 
     except Exception as e:
-        print(f"  Error scraping {url}: {e}")
-        # Save error info
-        error_path = os.path.join(page_dir, 'error.txt')
+        log(f"  Error scraping {url}: {e}")
+        error_path = os.path.join(pages_dir, slug + '.error.txt')
         with open(error_path, 'w', encoding='utf-8') as f:
             f.write(f"URL: {url}\n")
             f.write(f"Error: {str(e)}\n")
         return False
+
+
+def scrape_site(sitemap_url, output_dir, *, download_images=True, include_homepage=True,
+                delay=1.0, limit=None, headers=None, log=print):
+    """Crawl a site's sitemap into `output_dir` and return a summary dict.
+
+    Raises on fatal errors (bad sitemap, no URLs) so a caller can abort before
+    doing anything with a half-finished crawl. Per-page errors are non-fatal:
+    they are logged, recorded as failures, and the crawl continues.
+    """
+    headers = headers or DEFAULT_HEADERS
+    output_dir = os.path.abspath(output_dir)
+    pages_dir = os.path.join(output_dir, 'pages')
+    jsonld_dir = os.path.join(output_dir, 'jsonld')
+    images_dir = os.path.join(output_dir, 'images')
+    for d in (pages_dir, jsonld_dir, images_dir):
+        os.makedirs(d, exist_ok=True)
+
+    urls = fetch_sitemap(sitemap_url)
+    if not urls:
+        raise RuntimeError(f"No URLs found in sitemap: {sitemap_url}")
+
+    # Add homepage if not already in sitemap
+    if include_homepage:
+        parsed = urlparse(sitemap_url)
+        homepage_url = f"{parsed.scheme}://{parsed.netloc}/"
+        if homepage_url not in urls and homepage_url.rstrip('/') not in urls:
+            urls.insert(0, homepage_url)
+            log("Added homepage to URL list")
+
+    if limit:
+        urls = urls[:limit]
+
+    log(f"Scraping {len(urls)} URLs -> {output_dir}")
+
+    # Save URL list
+    urls_path = os.path.join(output_dir, 'urls_scraped.txt')
+    with open(urls_path, 'w', encoding='utf-8') as f:
+        f.write(f"Sitemap: {sitemap_url}\n")
+        f.write(f"Total URLs: {len(urls)}\n")
+        f.write("=" * 50 + "\n\n")
+        for url in urls:
+            f.write(url + "\n")
+
+    used_slugs = set()
+    image_manifest = {}
+    success_count = 0
+    fail_count = 0
+
+    for i, url in enumerate(urls, 1):
+        log(f"\n[{i}/{len(urls)}]")
+        ok = scrape_page(url, pages_dir, jsonld_dir, images_dir, headers,
+                         download_images=download_images, used_slugs=used_slugs,
+                         image_manifest=image_manifest, log=log)
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+
+        # Rate limiting
+        if i < len(urls):
+            time.sleep(delay)
+
+    # Persist the image manifest so hashed filenames stay traceable.
+    if download_images and image_manifest:
+        manifest_path = os.path.join(images_dir, '_manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(image_manifest, f, indent=2, ensure_ascii=False)
+
+    return {
+        'total': len(urls),
+        'success': success_count,
+        'failed': fail_count,
+        'output_dir': output_dir,
+    }
 
 
 def main():
@@ -311,87 +414,34 @@ def main():
         print("Please edit .env and set SITEMAP_URL to your sitemap URL")
         sys.exit(1)
 
-    # Setup
-    output_dir = os.path.abspath(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Single shared images directory
-    images_dir = os.path.join(output_dir, 'images')
-    os.makedirs(images_dir, exist_ok=True)
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-    }
-
     print("=" * 60)
     print("Website Scraper")
     print("=" * 60)
-
-    # Fetch sitemap URLs
-    try:
-        urls = fetch_sitemap(sitemap_url)
-    except Exception as e:
-        print(f"Error fetching sitemap: {e}")
-        sys.exit(1)
-
-    if not urls:
-        print("No URLs found in sitemap!")
-        sys.exit(1)
-
-    # Add homepage if not already in sitemap
-    if include_homepage:
-        parsed = urlparse(sitemap_url)
-        homepage_url = f"{parsed.scheme}://{parsed.netloc}/"
-        if homepage_url not in urls and homepage_url.rstrip('/') not in urls:
-            urls.insert(0, homepage_url)
-            print("Added homepage to URL list")
-
-    print(f"\nFound {len(urls)} URLs in sitemap")
-
-    if limit:
-        urls = urls[:limit]
-        print(f"Limiting to {limit} pages")
-
-    print(f"Output directory: {output_dir}")
     print(f"Download images: {download_images}")
     print(f"Delay between requests: {delay}s")
     print("=" * 60)
 
-    # Save URL list
-    urls_path = os.path.join(output_dir, 'urls_scraped.txt')
-    with open(urls_path, 'w', encoding='utf-8') as f:
-        f.write(f"Sitemap: {sitemap_url}\n")
-        f.write(f"Total URLs: {len(urls)}\n")
-        f.write("=" * 50 + "\n\n")
-        for url in urls:
-            f.write(url + "\n")
-
-    # Scrape each page
-    success_count = 0
-    fail_count = 0
-
-    for i, url in enumerate(urls, 1):
-        print(f"\n[{i}/{len(urls)}]", end="")
-
-        if scrape_page(url, output_dir, images_dir, headers, download_images=download_images):
-            success_count += 1
-        else:
-            fail_count += 1
-
-        # Rate limiting
-        if i < len(urls):
-            time.sleep(delay)
+    try:
+        summary = scrape_site(
+            sitemap_url,
+            output_dir,
+            download_images=download_images,
+            include_homepage=include_homepage,
+            delay=delay,
+            limit=limit,
+        )
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     # Summary
     print("\n" + "=" * 60)
     print("SCRAPING COMPLETE")
     print("=" * 60)
-    print(f"Total pages: {len(urls)}")
-    print(f"Successful: {success_count}")
-    print(f"Failed: {fail_count}")
-    print(f"Output saved to: {output_dir}")
+    print(f"Total pages: {summary['total']}")
+    print(f"Successful: {summary['success']}")
+    print(f"Failed: {summary['failed']}")
+    print(f"Output saved to: {summary['output_dir']}")
 
 
 if __name__ == '__main__':

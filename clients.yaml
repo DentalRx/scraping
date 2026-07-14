@@ -1,0 +1,46 @@
+# Client slug -> Notion "Clients" DB page id.
+#
+# `scrape.py --client <slug> --upload-drive` looks the slug up here to find the
+# Notion page, then reads that page's "Google Drive ID" property to know which
+# Drive to upload into. The Drive ID itself lives in Notion (single source of
+# truth), so onboarding a client is: create their Clients row, fill in
+# "Google Drive ID", then add a slug here pointing at the row.
+#
+# To find a page id: open the client's row in Notion, Share -> Copy link; the
+# 32-hex-char tail of the URL is the page id (dashed or undashed both work).
+#
+# Slugs are lowercase, no spaces. The two "Midtown" clients are disambiguated
+# as midtown-dental (Studio on Eglinton) and midtown-ortho (Orthodontics).
+
+clients:
+  sovrle:
+    name: Sovrle Dental
+    page_id: 291d7103-1902-802b-8d07-f67e2f9ce6f9
+
+  scarborosmiles:
+    name: ScarboroSmiles
+    page_id: 28ad7103-1902-809f-8fa8-ed28a9d65ef4
+
+  midtown-dental:
+    name: Midtown Dental Studio on Eglinton
+    page_id: 2e9d7103-1902-80f1-a3c7-d06ec6cce122
+
+  bloor-yorkville:
+    name: Bloor-Yorkville Periodontics
+    page_id: 2e9d7103-1902-806c-a784-e56a2cc76769
+
+  midtown-ortho:
+    name: Midtown Orthodontics
+    page_id: 2fcd7103-1902-8083-8f2a-f19fb36f145d
+
+  smilepass:
+    name: Smilepass
+    page_id: 377d7103-1902-80e2-927f-d8d18026686c
+
+  rebrief:
+    name: Rebrief
+    page_id: 377d7103-1902-807a-83a8-f1f401d822b3
+
+  prop:
+    name: Prop Architecture
+    page_id: 377d7103-1902-80d8-a275-d05611115300
