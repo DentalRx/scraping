@@ -64,7 +64,8 @@ def main(argv=None):
     download_images = not args.no_images and os.getenv("DOWNLOAD_IMAGES", "true").lower() == "true"
     include_homepage = not args.no_homepage and os.getenv("INCLUDE_HOMEPAGE", "true").lower() == "true"
     delay = args.delay if args.delay is not None else float(os.getenv("REQUEST_DELAY", "1.0"))
-    limit = args.limit if args.limit is not None else (int(os.getenv("PAGE_LIMIT")) if os.getenv("PAGE_LIMIT") else None)
+    page_limit = os.getenv("PAGE_LIMIT")
+    limit = args.limit if args.limit is not None else (int(page_limit) if page_limit else None)
 
     # Import the crawl here so plain scraping doesn't require the Drive/Notion deps.
     from scrape_sitemap import scrape_site

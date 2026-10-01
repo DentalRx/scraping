@@ -12,6 +12,8 @@ token.json
 
 # Editor / tooling
 /.claude
+.vscode/
+pyrightconfig.json
 
 # Python
 __pycache__/
