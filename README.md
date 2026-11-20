@@ -34,6 +34,38 @@ python scrape.py --url https://www.example.com/sitemap.xml --output-dir ./scrape
 `scrape_sitemap.py` (whole-site) and `scrape_blog.py` (blog → Markdown) still
 work standalone from `.env` as before.
 
+## Full "before" archive of an old site (`archive.py`)
+
+Before a rebuild, `archive.py` renders every page in Chromium and saves a
+complete archive for before/after comparisons and content migration:
+
+```
+Old Website Archive - YYYY-MM-DD (domain)/
+  README.md  pages.csv                index of every page, status, JSON-LD types, issues
+  01 Screenshots/Desktop (1440px)/    desktop-01-home.png ...  (full page)
+  01 Screenshots/Mobile (360px)/      mobile-01-home.png ...
+  02 Sitemaps/                        robots.txt + every sitemap XML as served, urls.txt
+  03 Content (Markdown)/              01-home.md ... + _site-navigation.md
+  04 Structured Data (JSON-LD)/       01-home.json ... + _all-jsonld.json
+  05 Images/                          every image (img, srcset, CSS backgrounds, og:image) + _manifest.json
+```
+
+A page has the same number in every folder. Pages come from the sitemap(s)
+plus same-site links found while crawling (menus, footer, legal pages); those
+missing from the sitemap are flagged in `README.md`.
+
+```bash
+pip install -r requirements.txt && python -m playwright install chromium
+
+python archive.py --site https://www.example.com                       # ./site_archive/<folder>
+python archive.py --site https://www.example.com --client sovrle --upload-drive
+python archive.py --site https://www.example.com --drive-parent <id> --upload-drive
+```
+
+`--max-file-mb 3` turns oversized full-page screenshots into JPEGs (or splits
+them into parts) for upload tools with a per-file cap. Other flags:
+`--sitemap`, `--max-pages`, `--no-screenshots`, `--no-images`, `--no-discover`.
+
 ## Scrape and upload to the client's Google Drive
 
 ```bash
