@@ -8,3 +8,9 @@ google-auth>=2.23.0
 
 # clients.yaml slug -> Notion page-id map
 PyYAML>=6.0
+
+# archive.py (rendered screenshots, markdown, images)
+# after installing, run once: python -m playwright install chromium
+playwright>=1.45
+markdownify>=0.13
+Pillow>=10.0
