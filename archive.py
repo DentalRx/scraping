@@ -289,6 +289,21 @@ def open_page(page, url):
     return resp
 
 
+SOFT_404 = re.compile(r"page not found|\b404\b|not be found", re.I)
+
+
+def full_shot(page, path, width):
+    """Full-page screenshot clipped to the viewport width.
+
+    An element that overflows to the right makes Playwright capture a wider image with a blank
+    band; visitors don't see that band, so it's cut. Returns the page's real scroll width.
+    """
+    w, h = page.evaluate("[document.documentElement.scrollWidth,"
+                         " Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]")
+    page.screenshot(path=path, full_page=True, clip={"x": 0, "y": 0, "width": width, "height": max(h, 1)})
+    return w
+
+
 def launch(pw):
     kw = {}
     for exe in (os.getenv("CHROMIUM_PATH"), "/opt/pw-browsers/chromium"):
@@ -325,6 +340,7 @@ def crawl(site, seed_urls, out, *, screenshots=True, discover=True, max_pages=50
         enqueue(u, "sitemap")
 
     pages, images, all_ld, nav_md, used = [], {}, [], [], set()
+    redirects, done = [], {}  # done: normalized url -> page number
     with sync_playwright() as pw:
         browser = launch(pw)
         desk = browser.new_context(viewport=DESKTOP, device_scale_factor=1, user_agent=DEFAULT_HEADERS["User-Agent"])
@@ -335,31 +351,52 @@ def crawl(site, seed_urls, out, *, screenshots=True, discover=True, max_pages=50
         while i < len(queue) and len(pages) < max_pages:
             url, source = queue[i]
             i += 1
+            if url in done:  # already archived as the target of an earlier redirect
+                continue
             num = f"{len(pages) + 1:02d}"
-            slug = page_slug(url)
-            while slug in used:
-                slug += "-" + hashlib.md5(url.encode()).hexdigest()[:4]
-            used.add(slug)
-            name = f"{num}-{slug}"
-            rec = {"num": num, "name": name, "url": url, "source": source,
+            rec = {"num": num, "name": "", "url": url, "source": source,
                    "in_sitemap": url in sitemap_set, "status": None, "final_url": "",
-                   "title": "", "jsonld_types": "", "error": ""}
+                   "title": "", "jsonld_types": "", "notes": "", "error": ""}
             log(f"[{num}] {url}")
             try:
                 resp = open_page(dp, url)
                 rec["status"] = resp.status if resp else None
                 rec["final_url"] = dp.url
+                final = norm_url(dp.url)
+                if final != url and final in done:
+                    # Redirect to a page already archived: list it, don't archive it twice.
+                    redirects.append({"url": url, "to": final, "num": done[final], "source": source,
+                                      "in_sitemap": rec["in_sitemap"]})
+                    log(f"     redirects to [{done[final]}] {final}, skipped")
+                    time.sleep(delay)
+                    continue
+                queued.add(final)  # don't crawl the redirect target again later
+                slug = page_slug(url)
+                while slug in used:
+                    slug += "-" + hashlib.md5(url.encode()).hexdigest()[:4]
+                used.add(slug)
+                name = rec["name"] = f"{num}-{slug}"
+                done[url] = done[final] = num
                 data = dp.evaluate(EXTRACT_JS)
                 raw_html = resp.text() if resp else ""
                 rendered = dp.content()
 
                 if screenshots:
-                    dp.screenshot(path=os.path.join(out, DIR_DESKTOP, f"desktop-{name}.png"), full_page=True)
+                    notes = []
+                    sw = full_shot(dp, os.path.join(out, DIR_DESKTOP, f"desktop-{name}.png"), DESKTOP["width"])
+                    if sw > DESKTOP["width"] + 2:
+                        notes.append(f"horizontal overflow on desktop ({sw}px wide)")
                     open_page(mp, url)
-                    mp.screenshot(path=os.path.join(out, DIR_MOBILE, f"mobile-{name}.png"), full_page=True)
+                    sw = full_shot(mp, os.path.join(out, DIR_MOBILE, f"mobile-{name}.png"), MOBILE["width"])
+                    if sw > MOBILE["width"] + 2:
+                        notes.append(f"horizontal overflow on mobile ({sw}px wide)")
+                    rec["notes"] = "; ".join(notes)
 
                 md, front = to_markdown(rendered, url, rec["status"], nav_md if not nav_md else None)
                 rec["title"] = front["title"]
+                if rec["status"] and rec["status"] < 400 and SOFT_404.search(rec["title"] or ""):
+                    rec["notes"] = "; ".join(filter(None, ["soft 404 (error page returned with status "
+                                                           f"{rec['status']})", rec["notes"]]))
                 with open(os.path.join(out, DIR_MD, f"{name}.md"), "w", encoding="utf-8") as f:
                     f.write(md)
 
@@ -399,6 +436,8 @@ def crawl(site, seed_urls, out, *, screenshots=True, discover=True, max_pages=50
                         enqueue(link, "link")
             except Exception as e:
                 rec["error"] = str(e).splitlines()[0][:300]
+                if not rec["name"]:
+                    rec["name"] = f"{num}-{page_slug(url)}"
                 log(f"     error: {rec['error']}")
             pages.append(rec)
             time.sleep(delay)
@@ -409,7 +448,7 @@ def crawl(site, seed_urls, out, *, screenshots=True, discover=True, max_pages=50
             f.write("# Site header, navigation and footer (from the home page)\n\n" + nav_md[0] + "\n")
     with open(os.path.join(out, DIR_JSONLD, "_all-jsonld.json"), "w", encoding="utf-8") as f:
         json.dump(all_ld, f, indent=2, ensure_ascii=False)
-    return pages, images
+    return pages, images, redirects
 
 
 # --------------------------------------------------------------------------- images
@@ -489,20 +528,24 @@ def cap_file_sizes(out, max_bytes, log=print):
 
 # --------------------------------------------------------------------------- index
 
-def write_index(out, site, folder_name, pages, sitemaps, manifest, failed_imgs, too_big):
+def write_index(out, site, folder_name, pages, sitemaps, manifest, failed_imgs, too_big, redirects=()):
     with open(os.path.join(out, "pages.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(pages[0].keys()) if pages else ["num"])
         w.writeheader()
         w.writerows(pages)
-    ok = [p for p in pages if p["status"] and p["status"] < 400 and not p["error"]]
+    ok = [p for p in pages if p["status"] and p["status"] < 400 and not p["error"]
+          and "soft 404" not in p["notes"]]
     bad = [p for p in pages if p not in ok]
     extra = [p for p in pages if not p["in_sitemap"] and p["source"] == "link"]
     with_ld = [p for p in pages if p["jsonld_types"]]
+    overflow = [p for p in pages if "overflow" in p["notes"]]
+    home_missing = sitemaps and pages and not pages[0]["in_sitemap"]
     L = [f"# {folder_name}", "",
          f"Archive of **{site}** captured on {date.today().isoformat()} before the rebuild.", "",
          f"- Pages captured: **{len(pages)}** ({len(ok)} OK, {len(bad)} with errors or 4xx/5xx)",
          f"- Sitemaps saved: {len(sitemaps)}",
          f"- Pages found through links but missing from the sitemap: {len(extra)}",
+         f"- Redirects (listed, not archived twice): {len(redirects)}",
          f"- Pages with JSON-LD: {len(with_ld)}",
          f"- Images downloaded: {len(manifest)} ({len(failed_imgs)} could not be downloaded)", "",
          "Each page has the same number in every folder: `desktop-NN-*.png`, `mobile-NN-*.png`, "
@@ -513,7 +556,18 @@ def write_index(out, site, folder_name, pages, sitemaps, manifest, failed_imgs, 
         L.append(f"| {p['num']} | [{p['title'] or p['name']}]({p['url']}) | {st} | "
                  f"{'yes' if p['in_sitemap'] else 'no'} | {p['jsonld_types'] or '—'} |")
     if bad:
-        L += ["", "## Pages with problems", ""] + [f"- {p['num']} {p['url']} — {p['error'] or p['status']}" for p in bad]
+        L += ["", "## Pages with problems", ""] + [
+            f"- {p['num']} {p['url']} — {p['error'] or ('soft 404' if 'soft 404' in p['notes'] else p['status'])}"
+            for p in bad]
+    if home_missing:
+        L += ["", "The home page is not listed in the sitemap."]
+    if redirects:
+        L += ["", "## Redirects (keep these working on the new site)", ""] + [
+            f"- {r['url']} → {r['to']} (page {r['num']})" for r in redirects]
+    if overflow:
+        L += ["", "## Layout problems", "",
+              "Screenshots are cropped to the viewport width; these pages scroll sideways:", ""] + [
+            f"- {p['num']} {p['url']} — {p['notes']}" for p in overflow]
     if extra:
         L += ["", "## Pages not in the sitemap (found through menus or links)", ""] + [f"- {p['num']} {p['url']}" for p in extra]
     if too_big:
@@ -582,10 +636,15 @@ def main(argv=None):
     print(f"Archiving {site} -> {out}")
 
     seeds, sitemaps = discover_sitemaps(site, os.path.join(out, DIR_SITEMAPS), a.sitemap)
-    pages, images = crawl(site, seeds, out, screenshots=not a.no_screenshots,
+    pages, images, redirects = crawl(site, seeds, out, screenshots=not a.no_screenshots,
                           discover=not a.no_discover, max_pages=a.max_pages, delay=a.delay)
     with open(os.path.join(out, DIR_SITEMAPS, "urls.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(p["url"] for p in pages) + "\n")
+    if redirects:
+        with open(os.path.join(out, DIR_SITEMAPS, "redirects.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["url", "to", "num", "source", "in_sitemap"])
+            w.writeheader()
+            w.writerows(redirects)
 
     if not any(p["status"] and p["status"] < 400 for p in pages):
         print("Error: no page loaded successfully; nothing uploaded. Is the site reachable from here?", file=sys.stderr)
@@ -596,7 +655,7 @@ def main(argv=None):
         manifest, failed = download_images(images, os.path.join(out, DIR_IMAGES))
 
     too_big = cap_file_sizes(out, int(a.max_file_mb * 1024 * 1024)) if a.max_file_mb else []
-    write_index(out, site, folder_name, pages, sitemaps, manifest, failed, too_big)
+    write_index(out, site, folder_name, pages, sitemaps, manifest, failed, too_big, redirects)
 
     print("\n" + "=" * 60)
     print(f"ARCHIVE COMPLETE: {len(pages)} pages, {len(manifest)} images")
